@@ -1,138 +1,207 @@
 import streamlit as st
-import pandas as pd
+import csv
 import random
+import time
 
-# ======================== CSV READER ==============================
+# ---------- CSV reading ----------
 def read_csv_to_dict(file):
-    df = pd.read_csv(file)
+    """
+    Expects CSV with header: TimeSlot,Slot1,Slot2,...
+    Each subsequent row: ProgramName, rating_for_slot0, rating_for_slot1, ...
+    Returns: programs (list), timeslots (list), ratings (dict program->list of floats)
+    """
+    reader = csv.reader((line.decode('utf-8') if isinstance(line, bytes) else line) for line in file)
+    header = next(reader)
+    timeslots = header[1:]
     program_ratings = {}
-    for row in df.itertuples(index=False):
-        program = row[0]  # First column: program name
-        ratings = list(row[1:])  # Remaining columns: ratings
+    programs = []
+    for row in reader:
+        if not row:
+            continue
+        program = row[0]
+        ratings = [float(x) for x in row[1:]]
         program_ratings[program] = ratings
-    return program_ratings
+        programs.append(program)
+    return programs, timeslots, program_ratings
 
-# ======================== GENETIC ALGORITHM ======================
+# ---------- Fitness ----------
 def fitness_function(schedule, ratings):
-    total = 0.0
+    # schedule is list of program names in order of time slots
+    # ratings[program] is list of floats for those time slots
+    total_rating = 0.0
     for time_slot, program in enumerate(schedule):
-        if program in ratings:
-            vals = ratings[program]
-            total += vals[time_slot] if time_slot < len(vals) else 0.0
-    return total
+        total_rating += ratings[program][time_slot]
+    return total_rating
 
-def crossover(schedule1, schedule2):
-    point = random.randint(1, len(schedule1) - 2)
-    child1 = schedule1[:point] + schedule2[point:]
-    child2 = schedule2[:point] + schedule1[point:]
-    return child1, child2
-
-def mutate(schedule, all_programs):
-    point = random.randint(0, len(schedule) - 1)
-    schedule[point] = random.choice(all_programs)
-    return schedule
-
-def initialize_population(all_programs, pop_size):
+# ---------- Population initialization ----------
+def initialize_population(programs, pop_size):
+    # create pop_size random permutations (avoid duplicates where possible)
     population = []
+    seen = set()
     for _ in range(pop_size):
-        schedule = random.sample(all_programs, len(all_programs))
-        population.append(schedule)
+        perm = tuple(random.sample(programs, len(programs)))
+        # try to avoid exact duplicate population members
+        attempts = 0
+        while perm in seen and attempts < 10:
+            perm = tuple(random.sample(programs, len(programs)))
+            attempts += 1
+        seen.add(perm)
+        population.append(list(perm))
     return population
 
-def genetic_algorithm(generations, pop_size, co_rate, mut_rate, elitism, all_programs, ratings):
-    population = initialize_population(all_programs, pop_size)
-    for _ in range(generations):
-        # Sort by fitness
-        population.sort(key=lambda s: fitness_function(s, ratings), reverse=True)
-        new_population = population[:elitism]
-        while len(new_population) < pop_size:
-            parent1, parent2 = random.choices(population, k=2)
-            if random.random() < co_rate:
-                child1, child2 = crossover(parent1, parent2)
-            else:
-                child1, child2 = parent1.copy(), parent2.copy()
-            if random.random() < mut_rate:
-                child1 = mutate(child1, all_programs)
-            if random.random() < mut_rate:
-                child2 = mutate(child2, all_programs)
-            new_population.extend([child1, child2])
-        population = new_population[:pop_size]
-    return max(population, key=lambda s: fitness_function(s, ratings))
+# ---------- Selection (tournament) ----------
+def tournament_selection(population, ratings, k=3):
+    # pick k random and return the best
+    competitors = random.sample(population, k)
+    best = max(competitors, key=lambda s: fitness_function(s, ratings))
+    return best
 
-# ======================== STREAMLIT UI ===========================
-st.title("Optimal Schedule Generator (3 GA Trials)")
-st.write("Upload a CSV of program ratings to optimize schedules using different crossover and mutation rates.")
+# ---------- Ordered Crossover (OX) for permutations ----------
+def ordered_crossover(parent1, parent2):
+    size = len(parent1)
+    if size < 2:
+        return parent1[:], parent2[:]
+    a, b = sorted(random.sample(range(size), 2))
+    # child will have slice from parent1 and filled from parent2 in order
+    child1 = [None]*size
+    child1[a:b+1] = parent1[a:b+1]
+    fill_pos = (b+1) % size
+    p2_idx = (b+1) % size
+    while None in child1:
+        if parent2[p2_idx] not in child1:
+            child1[fill_pos] = parent2[p2_idx]
+            fill_pos = (fill_pos + 1) % size
+        p2_idx = (p2_idx + 1) % size
 
-uploaded_file = st.file_uploader("Upload CSV file", type="csv")
+    child2 = [None]*size
+    child2[a:b+1] = parent2[a:b+1]
+    fill_pos = (b+1) % size
+    p1_idx = (b+1) % size
+    while None in child2:
+        if parent1[p1_idx] not in child2:
+            child2[fill_pos] = parent1[p1_idx]
+            fill_pos = (fill_pos + 1) % size
+        p1_idx = (p1_idx + 1) % size
 
-if uploaded_file is None:
-    st.info("Please upload a CSV file to begin.")
-    st.stop()
+    return child1, child2
 
-# Load data
-ratings = read_csv_to_dict(uploaded_file)
-all_programs = list(ratings.keys())
-all_time_slots = list(range(6, 6 + len(all_programs)))
+# ---------- Mutation (swap mutation) ----------
+def mutate_swap(schedule, mutation_rate):
+    schedule = schedule[:]  # copy
+    size = len(schedule)
+    # with probability mutation_rate, perform a swap (one or multiple)
+    for i in range(size):
+        if random.random() < mutation_rate:
+            j = random.randrange(size)
+            schedule[i], schedule[j] = schedule[j], schedule[i]
+    return schedule
 
-# ======================== SIDEBAR SLIDERS ========================
-st.sidebar.header("Trial 1 Parameters")
-tr1_co = st.sidebar.slider("Trial 1 Crossover Rate (CO_R)", 0.0, 1.0, 0.8, 0.01)
-tr1_mut = st.sidebar.slider("Trial 1 Mutation Rate (MUT_R)", 0.0, 1.0, 0.02, 0.01)
+# ---------- Evolve population ----------
+def evolve_population(population, ratings, elite_size=1, mutation_rate=0.05, tournament_k=3):
+    pop_size = len(population)
+    # evaluate fitness once
+    scored = [(fitness_function(s, ratings), s) for s in population]
+    scored.sort(reverse=True, key=lambda x: x[0])
+    new_pop = [s for (_, s) in scored[:elite_size]]  # elitism
 
-st.sidebar.header("Trial 2 Parameters")
-tr2_co = st.sidebar.slider("Trial 2 Crossover Rate (CO_R)", 0.0, 1.0, 0.75, 0.01)
-tr2_mut = st.sidebar.slider("Trial 2 Mutation Rate (MUT_R)", 0.0, 1.0, 0.03, 0.01)
+    # produce rest with selection + crossover + mutation
+    while len(new_pop) < pop_size:
+        parent1 = tournament_selection(population, ratings, k=tournament_k)
+        parent2 = tournament_selection(population, ratings, k=tournament_k)
+        # avoid identical parents
+        if parent1 == parent2:
+            parent2 = tournament_selection(population, ratings, k=tournament_k)
+        child1, child2 = ordered_crossover(parent1, parent2)
+        child1 = mutate_swap(child1, mutation_rate)
+        child2 = mutate_swap(child2, mutation_rate)
+        new_pop.append(child1)
+        if len(new_pop) < pop_size:
+            new_pop.append(child2)
+    return new_pop
 
-st.sidebar.header("Trial 3 Parameters")
-tr3_co = st.sidebar.slider("Trial 3 Crossover Rate (CO_R)", 0.0, 1.0, 0.85, 0.01)
-tr3_mut = st.sidebar.slider("Trial 3 Mutation Rate (MUT_R)", 0.0, 1.0, 0.04, 0.01)
+# ---------- GA run ----------
+def run_ga(programs, ratings, pop_size=100, generations=200, elite_size=1, mutation_rate=0.05, tournament_k=3, progress_callback=None):
+    population = initialize_population(programs, pop_size)
+    best_schedule = None
+    best_score = float("-inf")
+    for gen in range(generations):
+        # optionally report progress
+        if progress_callback:
+            progress_callback(gen, generations)
+        population = evolve_population(population, ratings, elite_size=elite_size, mutation_rate=mutation_rate, tournament_k=tournament_k)
+        # examine best in this population
+        current_best = max(population, key=lambda s: fitness_function(s, ratings))
+        current_score = fitness_function(current_best, ratings)
+        if current_score > best_score:
+            best_score = current_score
+            best_schedule = current_best[:]
+    return best_schedule, best_score
 
-# ======================== RUN TRIALS =============================
-if st.button("Run 3 Trials"):
-    with st.spinner("Running genetic algorithm trials..."):
-        trials = [
-            {"name": "Trial 1", "co": tr1_co, "mut": tr1_mut},
-            {"name": "Trial 2", "co": tr2_co, "mut": tr2_mut},
-            {"name": "Trial 3", "co": tr3_co, "mut": tr3_mut},
-        ]
+# ---------- Streamlit UI ----------
+st.title("Program Scheduling GA")
 
-        results = []
-        for t in trials:
-            best_schedule = genetic_algorithm(
-                generations=100,
-                pop_size=50,
-                co_rate=t["co"],
-                mut_rate=t["mut"],
-                elitism=2,
-                all_programs=all_programs,
-                ratings=ratings,
-            )
-            total = fitness_function(best_schedule, ratings)
-            results.append({
-                "Trial": t["name"],
-                "Crossover": t["co"],
-                "Mutation": t["mut"],
-                "Total Rating": total,
-                "Schedule": best_schedule
-            })
+uploaded_file = st.file_uploader("Upload CSV (first column program, rest slot ratings)", type=["csv"])
+if uploaded_file:
+    programs, timeslots, ratings = read_csv_to_dict(uploaded_file)
+    st.write(f"Detected {len(programs)} programs and {len(timeslots)} time slots.")
+    st.write("Time slots:", timeslots)
+    st.write("Programs (sample):", programs[:10])
 
-    # ======================== RESULTS DISPLAY =====================
-    st.subheader("Summary Comparison Table")
-    summary_df = pd.DataFrame(
-        [{"Trial": r["Trial"], "CO_R": r["Crossover"], "MUT_R": r["Mutation"], "Total Rating": r["Total Rating"]} for r in results]
-    )
-    st.dataframe(summary_df)
+    # GA parameters
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        pop_size = st.number_input("Population size", min_value=10, max_value=2000, value=200, step=10)
+        generations = st.number_input("Generations", min_value=1, max_value=5000, value=500, step=10)
+    with col2:
+        elite_size = st.number_input("Elitism (top N kept)", min_value=0, max_value=10, value=2)
+        mutation_rate = st.number_input("Mutation rate (0-1)", min_value=0.0, max_value=1.0, value=0.05, step=0.01)
+    with col3:
+        tournament_k = st.number_input("Tournament size (selection)", min_value=2, max_value=len(programs), value=3)
+        seed = st.checkbox("Set random seed for reproducibility")
+    if seed:
+        random.seed(42)
 
-    # Show best schedules individually
-    for r in results:
-        st.markdown(f"### {r['Trial']}: CO_R = {r['Crossover']:.2f}, MUT_R = {r['Mutation']:.2f}")
-        df = pd.DataFrame({
-            "Time Slot": [f"{t:02d}:00" for t in all_time_slots],
-            "Program": r["Schedule"]
-        })
-        st.dataframe(df)
-        st.bar_chart(pd.Series(
-            [ratings[p][i] if p in ratings and i < len(ratings[p]) else 0 for i, p in enumerate(r["Schedule"])],
-            index=[f"{t:02d}:00" for t in all_time_slots]
-        ))
-        st.write(f"**Total Rating:** {r['Total Rating']:.2f}")
+    if st.button("Run GA"):
+        start = time.time()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        def progress_callback(gen, gens):
+            progress_bar.progress(int((gen / max(1, gens - 1)) * 100))
+            status_text.text(f"Gen {gen+1}/{gens}")
+
+        best_schedule, best_score = run_ga(programs, ratings,
+                                           pop_size=int(pop_size),
+                                           generations=int(generations),
+                                           elite_size=int(elite_size),
+                                           mutation_rate=float(mutation_rate),
+                                           tournament_k=int(tournament_k),
+                                           progress_callback=progress_callback)
+        progress_bar.progress(100)
+        status_text.text("Done")
+        elapsed = time.time() - start
+
+        st.subheader("Best schedule found")
+        st.write(f"Total score: {best_score:.3f}   (found in {elapsed:.1f}s)")
+        # display schedule as a mapping time slot -> program -> rating
+        rows = []
+        for idx, program in enumerate(best_schedule):
+            slot_label = timeslots[idx] if idx < len(timeslots) else f"Slot {idx}"
+            rating = ratings[program][idx]
+            rows.append((idx+1, slot_label, program, rating))
+        # show as table
+        st.write("Order (time slot index, time label, program, rating at that slot):")
+        st.table(rows)
+
+        # also show schedule as list
+        st.write("Schedule order (programs):")
+        st.write(best_schedule)
+
+        # offer download as CSV
+        import io, csv
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["slot_index", "slot_label", "program", "rating"])
+        for r in rows:
+            writer.writerow(r)
+        st.download_button("Download schedule CSV", data=output.getvalue(), file_name="best_schedule.csv", mime="text/csv")
