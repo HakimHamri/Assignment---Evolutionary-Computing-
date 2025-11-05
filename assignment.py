@@ -137,11 +137,22 @@ if uploaded_file:
                 )
 
                 # Prepare schedule data
-                schedule_data = {
-                    "Time Slot": [f"{t:02d}:00" for t in all_time_slots],
-                    "Program": best_schedule[: len(all_time_slots)],
-                }
-                df_schedule = pd.DataFrame(schedule_data)
+                # Ensure both columns have the same length
+time_slots_formatted = [f"{t:02d}:00" for t in all_time_slots]
+programs_for_slots = best_schedule
+
+# If the program list is shorter, repeat or pad it
+if len(programs_for_slots) < len(time_slots_formatted):
+    programs_for_slots += [random.choice(all_programs) for _ in range(len(time_slots_formatted) - len(programs_for_slots))]
+elif len(programs_for_slots) > len(time_slots_formatted):
+    programs_for_slots = programs_for_slots[:len(time_slots_formatted)]
+
+schedule_data = {
+    "Time Slot": time_slots_formatted,
+    "Program": programs_for_slots,
+}
+
+df_schedule = pd.DataFrame(schedule_data)
 
                 st.markdown(f"**Parameters Used:**  CO_R = {co_r}, MUT_R = {mut_r}")
                 st.table(df_schedule)
