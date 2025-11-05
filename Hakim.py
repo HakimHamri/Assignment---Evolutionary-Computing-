@@ -1,289 +1,180 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import random
-from typing import Dict, List
+from io import StringIO
 
-# Configuration
-ALL_TIME_SLOTS = list(range(6, 24))  # 6:00 .. 23:00 inclusive (18 slots)
+st.set_page_config(page_title="TV Schedule Genetic Algorithm", layout="wide")
+st.title("TV Schedule Optimization (Genetic Algorithm)")
 
-# ---------- CSV reading ----------
-def read_csv_to_dict(file) -> Dict[str, List[float]]:
-    """
-    Reads a CSV where the first column is program name and subsequent columns are ratings.
-    If header of rating columns contains hour numbers (6..23) those are used to align; otherwise
-    ratings are assumed to map left-to-right starting at 6:00. Missing ratings are treated as 0.0.
-    Returns mapping: program -> list of length len(ALL_TIME_SLOTS).
-    """
-    df = pd.read_csv(file)
+st.markdown(
+    "Upload a CSV where the first column is the program name and the remaining columns are ratings "
+    "for each time slot (in order). Example header: Program,6,7,8,... or Program,slot1,slot2,..."
+)
+
+uploaded_file = st.file_uploader("Upload program_ratings.csv", type=["csv"])
+
+# GA hyperparameters defaults/ranges
+CO_DEFAULT = 0.8
+CO_MIN, CO_MAX = 0.0, 0.95
+MUT_MIN, MUT_MAX = 0.01, 0.05
+MUT_DEFAULT = 0.02  # chosen to be inside requested allowed range
+
+GEN_DEFAULT = 100
+POP_DEFAULT = 50
+ELITISM_DEFAULT = 2
+
+# Sidebar for global GA settings
+with st.sidebar:
+    st.header("GA Global Settings")
+    generations = st.number_input("Generations", min_value=1, value=GEN_DEFAULT, step=1)
+    population_size = st.number_input("Population Size", min_value=2, value=POP_DEFAULT, step=1)
+    elitism_size = st.number_input("Elitism Size", min_value=0, value=ELITISM_DEFAULT, step=1)
+    seed = st.number_input("Random seed (0 = none)", min_value=0, value=0, step=1)
+    if seed != 0:
+        random.seed(seed)
+
+def parse_ratings_csv(file_like):
+    # Returns (ratings_dict, programs_list, num_time_slots)
+    df = pd.read_csv(file_like)
     if df.shape[1] < 2:
-        raise ValueError("CSV must have program name column and at least one rating column.")
+        raise ValueError("CSV must have at least two columns: program and at least one time-slot rating column.")
+    program_col = df.columns[0]
+    program_names = df[program_col].astype(str).tolist()
+    rating_cols = df.columns[1:]
+    # convert ratings to floats
+    ratings = {}
+    for idx, prog in enumerate(program_names):
+        row = df.iloc[idx, 1:].tolist()
+        row_floats = [float(x) for x in row]
+        ratings[prog] = row_floats
+    num_slots = len(rating_cols)
+    # Determine time slot labels: if header values are numeric (like 6,7,8...), use them; otherwise create offsets
+    try:
+        time_labels = [int(x) for x in rating_cols]
+        # convert to displayable strings like "06:00"
+        time_labels = [f"{h:02d}:00" for h in time_labels]
+    except Exception:
+        # fallback: use 6:00.. or generic indices 1..n
+        time_labels = [f"Slot {i+1}" for i in range(num_slots)]
+    return ratings, program_names, time_labels
 
-    prog_col = df.columns[0]
-    rating_cols = list(df.columns[1:])
-
-    # Try to interpret rating columns as hour labels (ints) e.g. "6", "06:00", "6:00", "7"
-    col_hour_map = {}
-    for col in rating_cols:
-        try:
-            # try bare int
-            h = int(col)
-            col_hour_map[h] = col
-        except Exception:
-            # try parsing like "06:00" or "6:00" -> take hour part
-            try:
-                hour_part = str(col).split(":")[0]
-                h = int(hour_part)
-                col_hour_map[h] = col
-            except Exception:
-                # not parseable; ignore for now
-                pass
-
-    program_ratings = {}
-    n_slots = len(ALL_TIME_SLOTS)
-    for _, row in df.iterrows():
-        program = row[prog_col]
-        # initialize full-length rating list
-        ratings = [0.0] * n_slots
-        if col_hour_map:
-            # place available columns into proper slots
-            for h, colname in col_hour_map.items():
-                if h in ALL_TIME_SLOTS:
-                    idx = ALL_TIME_SLOTS.index(h)
-                    try:
-                        val = float(row[colname])
-                    except Exception:
-                        val = 0.0
-                    ratings[idx] = val
-        else:
-            # no hour-labeled columns: assume left-to-right mapping starting at 6:00
-            for i, colname in enumerate(rating_cols):
-                if i >= n_slots:
-                    break
-                try:
-                    val = float(row[colname])
-                except Exception:
-                    val = 0.0
-                ratings[i] = val
-        program_ratings[str(program)] = ratings
-    return program_ratings
-
-# ---------- GA helpers ----------
-def fitness_function(schedule: List[str], ratings: Dict[str, List[float]]) -> float:
-    total = 0.0
-    n = len(schedule)
-    for i, prog in enumerate(schedule):
-        vals = ratings.get(prog)
-        if vals and i < len(vals):
-            total += vals[i]
-        else:
-            # missing program or missing slot -> 0
-            total += 0.0
-    return total
-
-def greedy_initial_schedule(ratings: Dict[str, List[float]]) -> List[str]:
-    """
-    For each slot pick the program with the highest rating for that slot (break ties randomly).
-    If no programs exist, fill with "NOOP".
-    """
-    n_slots = len(ALL_TIME_SLOTS)
-    programs = list(ratings.keys())
-    if not programs:
-        return ["NOOP"] * n_slots
-
+# GA functions
+def greedy_initial_schedule(ratings, programs, num_slots):
+    # For each slot pick program with highest rating (allows repeats)
     schedule = []
-    for slot_idx in range(n_slots):
-        best_val = float('-inf')
-        best_progs = []
-        for p in programs:
-            vals = ratings.get(p, [])
-            val = vals[slot_idx] if slot_idx < len(vals) else 0.0
+    for t in range(num_slots):
+        best_prog = None
+        best_val = float("-inf")
+        for prog in programs:
+            val = ratings[prog][t]
             if val > best_val:
                 best_val = val
-                best_progs = [p]
-            elif val == best_val:
-                best_progs.append(p)
-        schedule.append(random.choice(best_progs) if best_progs else random.choice(programs))
+                best_prog = prog
+        schedule.append(best_prog)
     return schedule
 
-def initialize_population(seed_schedule: List[str], population_size: int, all_programs: List[str]) -> List[List[str]]:
-    n = len(seed_schedule)
-    population = []
-    # include seed
-    population.append(seed_schedule.copy())
-    # add slight variations of seed
-    for _ in range(max(0, population_size // 5 - 1)):
-        s = seed_schedule.copy()
-        # perform a few random swaps
-        for _ in range(3):
-            i, j = random.randrange(n), random.randrange(n)
-            s[i], s[j] = s[j], s[i]
-        population.append(s)
-    # fill the rest with fully random schedules (allow repetitions)
-    while len(population) < population_size:
-        population.append([random.choice(all_programs) for _ in range(n)])
-    return population
+def fitness_function(schedule, ratings):
+    total = 0.0
+    for t, prog in enumerate(schedule):
+        total += ratings[prog][t]
+    return total
 
-def crossover(parent1: List[str], parent2: List[str]) -> (List[str], List[str]):
-    n = len(parent1)
-    if n < 2:
-        return parent1.copy(), parent2.copy()
-    cp = random.randint(1, n - 1)
+def crossover(parent1, parent2):
+    if len(parent1) < 2:
+        return parent1[:], parent2[:]
+    cp = random.randint(1, len(parent1)-1)
     child1 = parent1[:cp] + parent2[cp:]
     child2 = parent2[:cp] + parent1[cp:]
     return child1, child2
 
-def mutate(schedule: List[str], all_programs: List[str], mutation_strength: int = 1) -> List[str]:
-    n = len(schedule)
-    s = schedule.copy()
-    for _ in range(mutation_strength):
-        i = random.randrange(n)
-        s[i] = random.choice(all_programs)
-    return s
+def mutate(schedule, programs):
+    idx = random.randrange(len(schedule))
+    schedule[idx] = random.choice(programs)
+    return schedule
 
-def tournament_selection(population: List[List[str]], ratings: Dict[str, List[float]], k: int = 3) -> List[str]:
-    contenders = random.sample(population, k)
-    contenders.sort(key=lambda s: fitness_function(s, ratings), reverse=True)
-    return contenders[0]
+def genetic_algorithm(ratings, programs, num_slots,
+                      generations=100, population_size=50,
+                      crossover_rate=0.8, mutation_rate=0.02, elitism_size=2):
+    # initialize population: start with greedy best, rest random
+    population = []
+    seed_individual = greedy_initial_schedule(ratings, programs, num_slots)
+    population.append(seed_individual)
+    for _ in range(population_size - 1):
+        individual = [random.choice(programs) for _ in range(num_slots)]
+        population.append(individual)
 
-def genetic_algorithm(seed_schedule: List[str],
-                      generations: int,
-                      population_size: int,
-                      crossover_rate: float,
-                      mutation_rate: float,
-                      elitism_size: int,
-                      all_programs: List[str],
-                      ratings: Dict[str, List[float]]) -> List[str]:
-    # Initialize population
-    population = initialize_population(seed_schedule, population_size, all_programs)
-
-    for _gen in range(generations):
-        # sort population by fitness (desc)
+    for gen in range(generations):
+        # evaluate and sort by fitness descending
         population.sort(key=lambda s: fitness_function(s, ratings), reverse=True)
-        new_pop = []
-        # elitism
-        new_pop.extend([p.copy() for p in population[:elitism_size]])
-
-        # generate children
+        new_pop = population[:elitism_size]  # preserve elites
+        # produce children
         while len(new_pop) < population_size:
-            parent1 = tournament_selection(population, ratings, k=3)
-            parent2 = tournament_selection(population, ratings, k=3)
+            parent1, parent2 = random.choices(population, k=2)
             if random.random() < crossover_rate:
                 child1, child2 = crossover(parent1, parent2)
             else:
-                child1, child2 = parent1.copy(), parent2.copy()
+                child1, child2 = parent1[:], parent2[:]
             if random.random() < mutation_rate:
-                child1 = mutate(child1, all_programs)
+                child1 = mutate(child1, programs)
             if random.random() < mutation_rate:
-                child2 = mutate(child2, all_programs)
+                child2 = mutate(child2, programs)
             new_pop.append(child1)
             if len(new_pop) < population_size:
                 new_pop.append(child2)
         population = new_pop
-
-    # return best individual
+    # final best
     population.sort(key=lambda s: fitness_function(s, ratings), reverse=True)
     return population[0]
 
-# ---------- Streamlit UI ----------
-st.title("Optimal Schedule Generator with 3 Trials")
-st.write("Upload a CSV with program ratings (first column program name, remaining columns ratings).")
-uploaded_file = st.file_uploader("Upload CSV file with program ratings", type="csv")
+if uploaded_file is not None:
+    try:
+        ratings, programs, time_labels = parse_ratings_csv(uploaded_file)
+    except Exception as e:
+        st.error(f"Error parsing CSV: {e}")
+        st.stop()
 
-if uploaded_file is None:
-    st.info("Awaiting CSV upload to run the optimizer.")
-    st.stop()
+    num_slots = len(time_labels)
+    st.success(f"Loaded {len(programs)} programs and {num_slots} time slots.")
 
-# Read CSV
-try:
-    ratings = read_csv_to_dict(uploaded_file)
-except Exception as e:
-    st.error(f"Failed to read CSV: {e}")
-    st.stop()
+    st.markdown("## Trial Parameters (set different parameters for each of the 3 trials)")
 
-all_programs = list(ratings.keys())
-if not all_programs:
-    st.error("No programs found in uploaded CSV.")
-    st.stop()
+    # Input widgets for 3 trials
+    trial_params = []
+    cols = st.columns(3)
+    for i in range(3):
+        with cols[i]:
+            st.subheader(f"Trial {i+1}")
+            co = st.slider(f"CO_R (Crossover Rate) - Trial {i+1}", min_value=CO_MIN, max_value=CO_MAX, value=CO_DEFAULT, step=0.01, key=f"co_{i}")
+            mut = st.slider(f"MUT_R (Mutation Rate) - Trial {i+1}", min_value=MUT_MIN, max_value=MUT_MAX, value=MUT_DEFAULT, step=0.01, key=f"mut_{i}")
+            trial_params.append((co, mut))
 
-# Sidebar GA params for three trials
-st.sidebar.header("Trial 1 Parameters")
-tr1_co = st.sidebar.slider("Trial 1 CO_R", 0.0, 1.0, 0.8, 0.01, key="tr1_co")
-tr1_mut = st.sidebar.slider("Trial 1 MUT_R", 0.0, 1.0, 0.02, 0.01, key="tr1_mut")
+    run_button = st.button("Run 3 Trials")
 
-st.sidebar.header("Trial 2 Parameters")
-tr2_co = st.sidebar.slider("Trial 2 CO_R", 0.0, 1.0, 0.75, 0.01, key="tr2_co")
-tr2_mut = st.sidebar.slider("Trial 2 MUT_R", 0.0, 1.0, 0.03, 0.01, key="tr2_mut")
-
-st.sidebar.header("Trial 3 Parameters")
-tr3_co = st.sidebar.slider("Trial 3 CO_R", 0.0, 1.0, 0.85, 0.01, key="tr3_co")
-tr3_mut = st.sidebar.slider("Trial 3 MUT_R", 0.0, 1.0, 0.04, 0.01, key="tr3_mut")
-
-generations = st.sidebar.number_input("Generations", min_value=10, max_value=5000, value=200, step=10)
-population_size = st.sidebar.number_input("Population Size", min_value=10, max_value=1000, value=100, step=10)
-elitism = st.sidebar.number_input("Elitism Size", min_value=0, max_value=10, value=2)
-
-# Seed schedule (greedy)
-seed_schedule = greedy_initial_schedule(ratings)
-
-if st.button("Run Trials"):
-    with st.spinner("Running trials..."):
+    if run_button:
+        st.markdown("## Results")
         results = []
-        # Trial 1
-        best1 = genetic_algorithm(
-            seed_schedule=seed_schedule,
-            generations=int(generations),
-            population_size=int(population_size),
-            crossover_rate=float(tr1_co),
-            mutation_rate=float(tr1_mut),
-            elitism_size=int(elitism),
-            all_programs=all_programs,
-            ratings=ratings
-        )
-        total1 = fitness_function(best1, ratings)
-        per_slot_ratings1 = [ratings.get(p, [0.0]*len(ALL_TIME_SLOTS))[i] for i, p in enumerate(best1)]
-        results.append(("Trial 1", tr1_co, tr1_mut, best1, per_slot_ratings1, total1))
-
-        # Trial 2
-        best2 = genetic_algorithm(
-            seed_schedule=seed_schedule,
-            generations=int(generations),
-            population_size=int(population_size),
-            crossover_rate=float(tr2_co),
-            mutation_rate=float(tr2_mut),
-            elitism_size=int(elitism),
-            all_programs=all_programs,
-            ratings=ratings
-        )
-        total2 = fitness_function(best2, ratings)
-        per_slot_ratings2 = [ratings.get(p, [0.0]*len(ALL_TIME_SLOTS))[i] for i, p in enumerate(best2)]
-        results.append(("Trial 2", tr2_co, tr2_mut, best2, per_slot_ratings2, total2))
-
-        # Trial 3
-        best3 = genetic_algorithm(
-            seed_schedule=seed_schedule,
-            generations=int(generations),
-            population_size=int(population_size),
-            crossover_rate=float(tr3_co),
-            mutation_rate=float(tr3_mut),
-            elitism_size=int(elitism),
-            all_programs=all_programs,
-            ratings=ratings
-        )
-        total3 = fitness_function(best3, ratings)
-        per_slot_ratings3 = [ratings.get(p, [0.0]*len(ALL_TIME_SLOTS))[i] for i, p in enumerate(best3)]
-        results.append(("Trial 3", tr3_co, tr3_mut, best3, per_slot_ratings3, total3))
-
-    # Display results
-    for name, co, mut, schedule, per_slot_ratings, total in results:
-        st.subheader(f"{name} (CO_R={co:.2f}, MUT_R={mut:.2f})")
-        rows = []
-        for i, prog in enumerate(schedule):
-            slot = ALL_TIME_SLOTS[i]
-            rows.append({"Time Slot": f"{slot:02d}:00", "Program": prog, "Rating": per_slot_ratings[i]})
-        df = pd.DataFrame(rows)
-        st.dataframe(df)
-        st.write(f"Total Rating: {total:.2f}")
-        # line chart
-        chart_idx = [f"{t:02d}:00" for t in ALL_TIME_SLOTS]
-        chart_series = pd.Series(per_slot_ratings, index=chart_idx)
-        st.line_chart(chart_series)
+        for i, (co, mut) in enumerate(trial_params, start=1):
+            st.markdown(f"### Trial {i} — CO_R={co:.2f}, MUT_R={mut:.2f}")
+            # run GA
+            best = genetic_algorithm(
+                ratings=ratings,
+                programs=programs,
+                num_slots=num_slots,
+                generations=generations,
+                population_size=population_size,
+                crossover_rate=co,
+                mutation_rate=mut,
+                elitism_size=elitism_size
+            )
+            total = fitness_function(best, ratings)
+            # Build table
+            df = pd.DataFrame({
+                "Time Slot": time_labels,
+                "Program": best,
+                "Rating": [ratings[p][t] for t, p in enumerate(best)]
+            })
+            st.write(f"Total Ratings: {total:.2f}")
+            st.table(df)
+else:
+    st.info("Please upload the program_ratings.csv to continue.")
